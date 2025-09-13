@@ -18,6 +18,12 @@
 FUNPAY_AUTH_TOKEN=golden_key
 API_ID=app_id
 API_HASH=api_hash
+
+AUTO_REFUND=true/false
+AUTO_DEACTIVATE=true/false
+
+CATEGORY_IDS=3064,2418
+REPLY_COOLDOWN_SECONDS=1.0
 ```
 
 Более подробная [Инструкция](https://teletype.in/@tinechelovec/Funpay-Telegram-Gifts)
