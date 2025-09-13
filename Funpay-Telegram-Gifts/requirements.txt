@@ -1,5 +1,4 @@
-pyrogram
-FunPayAPI
-python-dotenv
-tgcrypto
-colorlog
+pyrofork>=2.3.6
+tgcrypto>=1.2.5
+python-dotenv>=1.0.1
+colorlog>=6.8.2

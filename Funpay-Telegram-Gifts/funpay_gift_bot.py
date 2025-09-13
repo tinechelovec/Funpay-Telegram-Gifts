@@ -14,19 +14,59 @@ from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 
+# === Самопроверка PyroFork ===
+if not hasattr(Client, "send_gift"):
+    raise RuntimeError(
+        "Установлен неподдерживаемый пакет 'pyrogram'. Нужен форк с поддержкой Stars.\n"
+        "Используйте: pip uninstall -y pyrogram && pip install -U pyrofork tgcrypto"
+    )
+
+# ---------- ENV ----------
 load_dotenv()
 GOLDEN_KEY = os.getenv("FUNPAY_AUTH_TOKEN")
-API_ID = int(os.getenv("API_ID", "0"))
+API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
+API_ID = int(API_ID) if API_ID and API_ID.isdigit() else None
 
-CATEGORY_ID = int(os.getenv("CATEGORY_ID", "3064"))
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _env_raw(name: str):
+    return os.getenv(name)
+
+def _parse_id_list(val: Optional[str], default: str = "3064,2418") -> Tuple[List[int], List[str], str]:
+    raw = (val or default).strip()
+    tokens = re.split(r"[,\s;]+", raw)
+    ok: List[int] = []
+    bad: List[str] = []
+    for t in tokens:
+        if not t:
+            continue
+        try:
+            ok.append(int(t))
+        except Exception:
+            bad.append(t)
+    if not ok:
+        ok = [3064, 2418]
+    return ok, bad, raw
+
+RAW_IDS = os.getenv("CATEGORY_IDS") or os.getenv("CATEGORY_ID")
+CATEGORY_IDS_LIST, BAD_TOKENS, RAW_IDS_STR = _parse_id_list(RAW_IDS)
+ALLOWED_CATEGORY_IDS = set(CATEGORY_IDS_LIST)
+PRIMARY_CATEGORY_ID = CATEGORY_IDS_LIST[0]
+
 COOLDOWN_SECONDS = float(os.getenv("REPLY_COOLDOWN_SECONDS", "1.0"))
-DEACTIVATE_ON_LOW_STARS = os.getenv("DEACTIVATE_ON_LOW_STARS", "1") == "1"
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
-LOT_DEACTIVATE_SLEEP = float(os.getenv("LOT_DEACTIVATE_SLEEP", "0.35"))
+AUTO_REFUND_RAW = _env_raw("AUTO_REFUND")
+AUTO_DEACTIVATE_RAW = _env_raw("AUTO_DEACTIVATE")
+AUTO_REFUND = _env_bool("AUTO_REFUND", True)
+AUTO_DEACTIVATE = _env_bool("AUTO_DEACTIVATE", True)
 
 LOG_NAME = "FunPay-Gifts"
 
+# ---------- ЛОГИ ----------
 try:
     handler = colorlog.StreamHandler()
     color_formatter = colorlog.ColoredFormatter(
@@ -38,7 +78,6 @@ try:
             "ERROR": "red",
             "CRITICAL": "red,bg_white",
         },
-        secondary_log_colors={},
     )
     handler.setFormatter(color_formatter)
     logger = colorlog.getLogger(LOG_NAME)
@@ -53,50 +92,47 @@ except Exception:
     logger = logging.getLogger(LOG_NAME)
 
 def log_info(ctx: str, msg: str):
-    if ctx:
-        logger.info(f"{ctx} | {msg}")
-    else:
-        logger.info(msg)
-
+    logger.info(f"{ctx + ' | ' if ctx else ''}{msg}")
 
 def log_warn(ctx: str, msg: str):
-    if ctx:
-        logger.warning(f"{ctx} | {msg}")
-    else:
-        logger.warning(msg)
-
+    logger.warning(f"{ctx + ' | ' if ctx else ''}{msg}")
 
 def log_error(ctx: str, msg: str):
-    if ctx:
-        logger.error(f"{ctx} | {msg}")
-    else:
-        logger.error(msg)
+    logger.error(f"{ctx + ' | ' if ctx else ''}{msg}")
 
-
+# ---------- ПОДАРКИ ----------
 with open("gifts.json", "r", encoding="utf-8") as f:
     GIFTS = json.load(f)
 
 loop = asyncio.new_event_loop()
 app: Optional[Client] = None
+_app_started = threading.Event()
 
+def _build_client() -> Client:
+    if API_ID and API_HASH:
+        return Client("stars", api_id=API_ID, api_hash=API_HASH, workdir="sessions")
+    else:
+        return Client("stars", workdir="sessions")
 
-def start_pyrogram():
+async def _runner_start():
     global app
+    app = _build_client()
+    await app.start()
+    log_info("", "Pyrogram запущен — готов отправлять подарки.")
+    _app_started.set()
+
+def _thread_target():
     asyncio.set_event_loop(loop)
-    app = Client("stars", api_id=API_ID, api_hash=API_HASH, workdir="sessions")
-
-    async def runner():
-        await app.start()
-        log_info("", "Pyrogram запущен — готов отправлять подарки.")
-
-    loop.run_until_complete(runner())
+    loop.run_until_complete(_runner_start())
     loop.run_forever()
 
+threading.Thread(target=_thread_target, daemon=True).start()
 
-threading.Thread(target=start_pyrogram, daemon=True).start()
+_app_started.wait(timeout=10.0)
+if not _app_started.is_set():
+    log_warn("", "Pyrogram не успел стартовать за 10 сек. Продолжаю — вызовы подождут через future.")
 
 waiting: dict[int, dict] = {}
-
 
 def _safe_attr(o: Any, *names: str, default: Any = None):
     for n in names:
@@ -108,11 +144,9 @@ def _safe_attr(o: Any, *names: str, default: Any = None):
             pass
     return default
 
-
 def short_text(s: Any, n: int = 180) -> str:
     s = "" if s is None else str(s)
     return s if len(s) <= n else s[: n - 1] + "…"
-
 
 def parse_gift_num(text: str) -> Optional[str]:
     if not text:
@@ -123,7 +157,6 @@ def parse_gift_num(text: str) -> Optional[str]:
     nums = [x.strip() for x in m.group(1).split(",") if x.strip().isdigit()]
     return nums[0] if nums else None
 
-
 def nick_looks_valid(txt: str) -> bool:
     if not txt:
         return False
@@ -131,7 +164,6 @@ def nick_looks_valid(txt: str) -> bool:
     if t.startswith("@"):
         t = t[1:]
     return bool(re.fullmatch(r"[A-Za-z0-9_]{5,32}", t))
-
 
 def get_subcategory_id_safe(order, account) -> Tuple[Optional[int], Optional[object]]:
     subcat = getattr(order, "subcategory", None) or getattr(order, "sub_category", None)
@@ -145,7 +177,6 @@ def get_subcategory_id_safe(order, account) -> Tuple[Optional[int], Optional[obj
     except Exception as e:
         logger.debug(f"Не удалось загрузить полный заказ: {e}", exc_info=True)
     return None, None
-
 
 def pretty_order_context(order_obj=None, buyer_id=None, gift=None):
     try:
@@ -167,25 +198,23 @@ def pretty_order_context(order_obj=None, buyer_id=None, gift=None):
         parts.append(f"Gift {title} ({price}⭐, id={gid})")
     return " | ".join(parts)
 
+async def _send_gift_once(username: str, gift_id: int):
+    uname = username.lstrip("@")
+    await asyncio.sleep(0.05)
+    res = await app.send_gift(chat_id=uname, gift_id=gift_id)
+    return res
 
-async def send_gift_once(username: str, gift_id: int):
+def send_gift_sync(username: str, gift_id: int, timeout: float = 30.0) -> Tuple[bool, str]:
+    if app is None:
+        return False, "Pyrogram app is not started"
+    fut = asyncio.run_coroutine_threadsafe(_send_gift_once(username, gift_id), loop)
     try:
-        uname = username.lstrip("@")
-        res = await app.send_gift(chat_id=uname, gift_id=gift_id)
+        res = fut.result(timeout=timeout)
         return True, str(res)
     except Exception as e:
         return False, str(e)
 
-
-def send_gift_sync(username: str, gift_id: int, timeout: float = 30.0) -> Tuple[bool, str]:
-    fut = asyncio.run_coroutine_threadsafe(send_gift_once(username, gift_id), loop)
-    try:
-        return fut.result(timeout=timeout)
-    except Exception as e:
-        return False, f"Timeout/await error: {e}"
-
-
-async def get_stars_balance_once() -> int:
+async def _get_stars_balance_once() -> int:
     try:
         bal = await app.get_stars_balance()
         if isinstance(bal, (int, float)):
@@ -205,16 +234,17 @@ async def get_stars_balance_once() -> int:
         logger.debug(f"get_stars_balance failed: {e}", exc_info=True)
         return 0
 
-
 def get_stars_balance_sync(timeout: float = 10.0) -> int:
-    fut = asyncio.run_coroutine_threadsafe(get_stars_balance_once(), loop)
+    if app is None:
+        return 0
+    fut = asyncio.run_coroutine_threadsafe(_get_stars_balance_once(), loop)
     try:
         return fut.result(timeout=timeout)
     except Exception as e:
         logger.debug(f"get_stars_balance_sync error: {e}", exc_info=True)
         return 0
 
-
+# ---------- FUNPAY-ПРОЦЕДУРЫ ----------
 def refund_order(account: Account, order_id: int, chat_id: int, ctx: str = "") -> bool:
     try:
         account.refund(order_id)
@@ -233,14 +263,13 @@ def refund_order(account: Account, order_id: int, chat_id: int, ctx: str = "") -
             pass
         return False
 
-
 def _list_my_subcat_lots(account: Account, subcat_id: int):
     try:
         lots = account.get_my_subcategory_lots(subcat_id)
         log_info("", f"Найдено {len(lots)} лотов в подкатегории {subcat_id}.")
         return lots
-    except Exception as e:
-        logger.debug("get_my_subcategory_lots failed, пытаю запасной путь", exc_info=True)
+    except Exception:
+        logger.debug("get_my_subcategory_lots failed, пробую запасной путь", exc_info=True)
 
     try:
         categories = account.get_categories()
@@ -256,7 +285,6 @@ def _list_my_subcat_lots(account: Account, subcat_id: int):
         logger.debug("Подробности получения лотов:", exc_info=True)
         return []
 
-
 def update_lot_state(account: Account, lot, active: bool) -> bool:
     attempts = 3
     while attempts:
@@ -264,9 +292,6 @@ def update_lot_state(account: Account, lot, active: bool) -> bool:
             lot_fields = account.get_lot_fields(lot.id)
             if getattr(lot_fields, "active", None) == active:
                 log_info("", f"Лот {getattr(lot,'id', '?')} уже active={active}")
-                return True
-            if DRY_RUN:
-                log_info("", f"[DRY_RUN] Пропущено изменение лота {lot.id} -> active={active}")
                 return True
             lot_fields.active = active
             account.save_lot(lot_fields)
@@ -276,43 +301,41 @@ def update_lot_state(account: Account, lot, active: bool) -> bool:
             log_error("", f"Ошибка при изменении лота {getattr(lot,'id','?')}: {short_text(e)}")
             logger.debug("Подробности update_lot_state:", exc_info=True)
             attempts -= 1
-            time.sleep(1.0)
+            time.sleep(min(0.5 * (3 - attempts), 1.5))
     log_error("", f"Не удалось изменить лот {getattr(lot,'id','?')} (исчерпаны попытки)")
     return False
 
-
 def deactivate_lots(account: Account, subcat_id: int):
-    if not DEACTIVATE_ON_LOW_STARS:
-        log_info("", "Авто-деактивация лотов отключена.")
-        return
     log_warn("", f"Запускаю деактивацию лотов в подкатегории {subcat_id}...")
     lots = _list_my_subcat_lots(account, subcat_id)
     if not lots:
         log_info("", "Лоты не найдены — пропускаю деактивацию.")
         return
     affected: List[str] = []
+    consecutive_errors = 0
     for lot in lots:
         try:
             fields = account.get_lot_fields(lot.id)
             is_active = bool(getattr(fields, "active", False))
-            title = short_text(
-                _safe_attr(lot, "title", "description", default=str(getattr(lot, "id", "?"))), 80
-            )
+            title = short_text(_safe_attr(lot, "title", "description", default=str(getattr(lot, "id", "?"))), 80)
             if not is_active:
                 log_info("", f"Лот уже выключен: {title} (id={lot.id})")
                 continue
             ok = update_lot_state(account, lot, active=False)
             if ok:
                 affected.append(f"{title} (id={lot.id})")
-            time.sleep(LOT_DEACTIVATE_SLEEP)
+                consecutive_errors = 0
         except Exception as e:
             log_error("", f"Ошибка при деактивации лота {getattr(lot,'id','?')}: {short_text(e)}")
             logger.debug("Подробности деактивации лота:", exc_info=True)
+            consecutive_errors += 1
+        if consecutive_errors:
+            pause = min(0.2 * consecutive_errors, 1.5)
+            time.sleep(pause)
     if affected:
         log_warn("", "Деактивированы лоты:\n- " + "\n- ".join(affected))
     else:
         log_info("", "Не было активных лотов для деактивации.")
-
 
 def classify_send_error(info: str) -> str:
     if not info:
@@ -326,11 +349,26 @@ def classify_send_error(info: str) -> str:
         return "username_not_found"
     return "other"
 
-
+# ---------- ОСНОВНОЙ ЦИКЛ ----------
 def main():
-    if not GOLDEN_KEY or not API_ID or not API_HASH:
-        log_error("", "В .env должны быть: GOLDEN_KEY (или FUNPAY_AUTH_TOKEN), API_ID, API_HASH")
+    if not GOLDEN_KEY:
+        log_error("", "В .env должен быть FUNPAY_AUTH_TOKEN")
         return
+
+    if BAD_TOKENS:
+        log_warn("", f"CATEGORY_ID(S) содержит нечисловые значения и они будут проигнорированы: {BAD_TOKENS}")
+    log_info("", f"Категории: {CATEGORY_IDS_LIST} (primary={PRIMARY_CATEGORY_ID})")
+
+    if AUTO_REFUND_RAW is None:
+        log_warn("", "AUTO_REFUND не задан в .env → использую по умолчанию: ON")
+    else:
+        log_info("", f"AUTO_REFUND задан пользователем: {AUTO_REFUND_RAW} → эффективно: {AUTO_REFUND}")
+    if AUTO_DEACTIVATE_RAW is None:
+        log_warn("", "AUTO_DEACTIVATE не задан в .env → использую по умолчанию: ON")
+    else:
+        log_info("", f"AUTO_DEACTIVATE задан пользователем: {AUTO_DEACTIVATE_RAW} → эффективно: {AUTO_DEACTIVATE}")
+
+    log_info("", f"Итого настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, COOLDOWN={COOLDOWN_SECONDS}")
 
     account = Account(GOLDEN_KEY)
     account.get()
@@ -352,8 +390,9 @@ def main():
 
             if isinstance(event, NewOrderEvent):
                 order = account.get_order(event.order.id)
-                subcat_id, subcat = get_subcategory_id_safe(order, account)
-                if subcat_id != CATEGORY_ID:
+                subcat_id, _ = get_subcategory_id_safe(order, account)
+
+                if subcat_id not in ALLOWED_CATEGORY_IDS:
                     logger.debug(f"Пропуск заказа #{getattr(order,'id','?')}: subcat={subcat_id}")
                     continue
 
@@ -371,12 +410,15 @@ def main():
                         "❌ В описании заказа отсутствует обязательный параметр gift_tg. "
                         "Произошла ошибка при обработке заказа — сейчас оформляем возврат средств.",
                     )
-                    log_warn(ctx, "Отсутствует gift_tg в описании → оформляю возврат")
-                    try:
-                        refund_order(account, order.id, order.chat_id, ctx=ctx)
-                    except Exception as e:
-                        log_error(ctx, f"Ошибка при оформлении возврата: {short_text(e)}")
-                        logger.debug("Подробности ошибки возврата:", exc_info=True)
+                    log_warn(ctx, "Отсутствует gift_tg в описании → возврат (если включён)")
+                    if AUTO_REFUND:
+                        try:
+                            refund_order(account, order.id, order.chat_id, ctx=ctx)
+                        except Exception as e:
+                            log_error(ctx, f"Ошибка при оформлении возврата: {short_text(e)}")
+                            logger.debug("Подробности ошибки возврата:", exc_info=True)
+                    else:
+                        account.send_message(order.chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
                     last_reply_ts = now
                     continue
 
@@ -394,10 +436,12 @@ def main():
                     "gift": gift,
                     "state": "awaiting_nick",
                     "temp_nick": None,
+                    "subcat_id": subcat_id,
                 }
                 account.send_message(
                     order.chat_id,
-                    f"Спасибо за покупку! К выдаче: {gift['title']} ({gift['price']}⭐).\nПришлите ваш Telegram-тег (пример: @username).",
+                    f"Спасибо за покупку! К выдаче: {gift['title']} ({gift['price']}⭐).\n"
+                    f"Пришлите ваш Telegram-тег (пример: @username).",
                 )
                 log_info(pretty_order_context(order, gift=gift), "Ждём ник.")
                 last_reply_ts = now
@@ -419,10 +463,12 @@ def main():
                         account.send_message(chat_id, "Неверный тег. Отправьте в виде @username (5–32 символа).")
                         last_reply_ts = now
                         continue
-                    st["temp_nick"] = text.lstrip()
+                    st["temp_nick"] = text.strip()
                     st["state"] = "awaiting_confirmation"
                     account.send_message(
-                        chat_id, f'Вы указали {st["temp_nick"]} для получения {gift["title"]} ({gift["price"]}⭐).\nЕсли верно — напишите "+"'
+                        chat_id,
+                        f'Вы указали {st["temp_nick"]} для получения {gift["title"]} ({gift["price"]}⭐).\n'
+                        f'Если верно — напишите "+"',
                     )
                     log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), "Ник получен — ждём подтверждение.")
                     last_reply_ts = now
@@ -433,12 +479,20 @@ def main():
                         username = st["temp_nick"]
                         account.send_message(chat_id, f"Отправляю {gift['title']} пользователю {username}...")
                         log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), f"Отправка -> {username}")
+
                         ok, info = send_gift_sync(username, gift_id=gift["id"])
                         ctx = pretty_order_context(None, buyer_id=author_id, gift=gift)
 
                         if ok:
-                            account.send_message(chat_id, f"Подарок успешно отправлен на {username}.")
-                            log_info(ctx, f"УСПЕХ -> {username}")
+                            time.sleep(0.4)
+                            account.send_message(chat_id, f"🎉 Подарок успешно отправлен на {username}!")
+                            order_url = f"https://funpay.com/orders/{order_id}/"
+                            account.send_message(
+                                chat_id,
+                                "🙏 Пожалуйста, подтвердите выполнение заказа и оставьте отзыв — это очень помогает! "
+                                f"Ссылка на заказ: {order_url}"
+                            )
+                            log_info(ctx, f"УСПЕХ -> {username} (review requested)")
                         else:
                             full_err = str(info)
                             log_error(ctx, f"Полная ошибка отправки: {full_err}")
@@ -447,36 +501,46 @@ def main():
                             kind = classify_send_error(full_err)
 
                             if kind == "balance_low":
-                                account.send_message(chat_id, "❌ Произошла ошибка при отправке подарка. Сейчас оформим возврат средств.")
-                                log_warn(ctx, "BALANCE_TOO_LOW detected -> деактивация лотов + возврат")
-                                try:
-                                    deactivate_lots(account, CATEGORY_ID)
-                                except Exception as e:
-                                    log_error(ctx, f"Ошибка при деактивации лотов: {short_text(e)}")
-                                    logger.debug("Подробности деактивации:", exc_info=True)
-                                try:
-                                    refund_order(account, order_id, chat_id, ctx=ctx)
-                                except Exception as e:
-                                    log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
-                                    logger.debug("Подробности возврата:", exc_info=True)
+                                account.send_message(chat_id, "❌ Ошибка при отправке подарка: недостаточно звёзд.")
+                                log_warn(ctx, "BALANCE_TOO_LOW")
+                                if AUTO_DEACTIVATE:
+                                    for cid in CATEGORY_IDS_LIST:
+                                        try:
+                                            deactivate_lots(account, cid)
+                                        except Exception as e:
+                                            log_error(ctx, f"Ошибка деактивации в {cid}: {e}")
+                                if AUTO_REFUND:
+                                    try:
+                                        refund_order(account, order_id, chat_id, ctx=ctx)
+                                    except Exception as e:
+                                        log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
+                                        logger.debug("Подробности возврата:", exc_info=True)
+                                else:
+                                    account.send_message(chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
 
                             elif kind == "username_not_found":
-                                account.send_message(chat_id, "❌ Неверный ник или такой пользователь не найден. Оформляю возврат средств.")
-                                log_warn(ctx, "USERNAME_NOT_OCCUPIED -> возврат (лоты не трогаю)")
-                                try:
-                                    refund_order(account, order_id, chat_id, ctx=ctx)
-                                except Exception as e:
-                                    log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
-                                    logger.debug("Подробности возврата:", exc_info=True)
+                                account.send_message(chat_id, "❌ Неверный ник или такой пользователь не найден.")
+                                log_warn(ctx, "USERNAME_NOT_OCCUPIED")
+                                if AUTO_REFUND:
+                                    try:
+                                        refund_order(account, order_id, chat_id, ctx=ctx)
+                                    except Exception as e:
+                                        log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
+                                        logger.debug("Подробности возврата:", exc_info=True)
+                                else:
+                                    account.send_message(chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
 
                             else:
-                                account.send_message(chat_id, "❌ Неизвестная ошибка при отправке подарка. Оформляю возврат средств.")
-                                log_warn(ctx, "Неизвестная ошибка -> пробую оформить возврат")
-                                try:
-                                    refund_order(account, order_id, chat_id, ctx=ctx)
-                                except Exception as e:
-                                    log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
-                                    logger.debug("Подробности возврата:", exc_info=True)
+                                account.send_message(chat_id, "❌ Неизвестная ошибка при отправке подарка.")
+                                log_warn(ctx, "UNKNOWN_ERROR")
+                                if AUTO_REFUND:
+                                    try:
+                                        refund_order(account, order_id, chat_id, ctx=ctx)
+                                    except Exception as e:
+                                        log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
+                                        logger.debug("Подробности возврата:", exc_info=True)
+                                else:
+                                    account.send_message(chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
 
                         waiting.pop(author_id, None)
                         last_reply_ts = now
@@ -485,7 +549,7 @@ def main():
                             account.send_message(chat_id, "Неверный тег. Отправьте в виде @username.")
                             last_reply_ts = now
                             continue
-                        st["temp_nick"] = text
+                        st["temp_nick"] = text.strip()
                         account.send_message(chat_id, f'Обновлено: {st["temp_nick"]}. Если верно — напишите "+"')
                         log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), f"Ник обновлён -> {st['temp_nick']}")
                         last_reply_ts = now
@@ -493,7 +557,6 @@ def main():
         except Exception as e:
             log_error("", f"Ошибка обработки события: {short_text(e)}")
             logger.debug("Подробности ошибки обработки события:", exc_info=True)
-
 
 if __name__ == "__main__":
     main()
