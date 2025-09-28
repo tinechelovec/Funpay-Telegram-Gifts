@@ -14,7 +14,6 @@ from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 
-# === Самопроверка PyroFork ===
 if not hasattr(Client, "send_gift"):
     raise RuntimeError(
         "Установлен неподдерживаемый пакет 'pyrogram'. Нужен форк с поддержкой Stars.\n"
@@ -63,6 +62,9 @@ AUTO_REFUND_RAW = _env_raw("AUTO_REFUND")
 AUTO_DEACTIVATE_RAW = _env_raw("AUTO_DEACTIVATE")
 AUTO_REFUND = _env_bool("AUTO_REFUND", True)
 AUTO_DEACTIVATE = _env_bool("AUTO_DEACTIVATE", True)
+
+ANONYMOUS_GIFTS_RAW = _env_raw("ANONYMOUS_GIFTS")
+ANONYMOUS_GIFTS = _env_bool("ANONYMOUS_GIFTS", False)
 
 LOG_NAME = "FunPay-Gifts"
 
@@ -133,6 +135,7 @@ if not _app_started.is_set():
     log_warn("", "Pyrogram не успел стартовать за 10 сек. Продолжаю — вызовы подождут через future.")
 
 waiting: dict[int, dict] = {}
+_last_reply_by_buyer: dict[int, float] = {}
 
 def _safe_attr(o: Any, *names: str, default: Any = None):
     for n in names:
@@ -198,11 +201,50 @@ def pretty_order_context(order_obj=None, buyer_id=None, gift=None):
         parts.append(f"Gift {title} ({price}⭐, id={gid})")
     return " | ".join(parts)
 
-async def _send_gift_once(username: str, gift_id: int):
+# ---------- ОТПРАВКА ПОДАРКА ----------
+async def _send_gift_once(username: str, gift_id: int) -> bool:
     uname = username.lstrip("@")
     await asyncio.sleep(0.05)
-    res = await app.send_gift(chat_id=uname, gift_id=gift_id)
-    return res
+
+    attempts = [
+        {"gift_id": gift_id},
+        {"star_gift_id": gift_id},
+    ]
+
+    last_err: Optional[Exception] = None
+    for i, extra in enumerate(attempts, 1):
+        try:
+            log_info("send_gift", f"Попытка {i}: keys={list(extra.keys())}, anon={ANONYMOUS_GIFTS}")
+            res = await app.send_gift(chat_id=uname, hide_my_name=ANONYMOUS_GIFTS, **extra)
+            if isinstance(res, bool):
+                return res
+            return True
+        except TypeError as e:
+            s = str(e)
+            last_err = e
+            if "unexpected keyword argument" in s:
+                log_warn("send_gift", f"Сигнатура не приняла {list(extra.keys())}: {e}")
+                continue
+            if "NoneType" in s and "len()" in s:
+                log_warn("send_gift", f"Баг len(None) в реализации: {e} — пробую следующий вариант")
+                continue
+            log_warn("send_gift", f"TypeError: {e} — пробую следующий вариант")
+            continue
+        except Exception as e:
+            last_err = e
+            log_warn("send_gift", f"Неизвестная ошибка: {e} — короткий повтор")
+            await asyncio.sleep(0.4)
+            try:
+                res = await app.send_gift(chat_id=uname, hide_my_name=ANONYMOUS_GIFTS, **extra)
+                return bool(res)
+            except Exception as e2:
+                last_err = e2
+                log_error("send_gift", f"Повтор не помог: {e2}")
+                continue
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("Не удалось подобрать сигнатуру send_gift для этой сборки.")
 
 def send_gift_sync(username: str, gift_id: int, timeout: float = 30.0) -> Tuple[bool, str]:
     if app is None:
@@ -341,12 +383,20 @@ def classify_send_error(info: str) -> str:
     if not info:
         return "other"
     lower = info.lower()
+
     if "balance_too_low" in lower or "balance too low" in lower or "not enough stars" in lower or "недостат" in lower:
         return "balance_low"
     if "400 balance_too_low" in lower or "payments.sendstarsform" in lower:
         return "balance_low"
+
     if "username_not_occupied" in lower or "contacts.resolveusername" in lower or "provided username is not occupied" in lower:
         return "username_not_found"
+    if "peer_id_invalid" in lower:
+        return "username_not_found"
+
+    if "flood" in lower or "too many requests" in lower or "slowmode" in lower:
+        return "flood"
+
     return "other"
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
@@ -364,11 +414,17 @@ def main():
     else:
         log_info("", f"AUTO_REFUND задан пользователем: {AUTO_REFUND_RAW} → эффективно: {AUTO_REFUND}")
     if AUTO_DEACTIVATE_RAW is None:
-        log_warn("", "AUTO_DEACTIVATE не задан в .env → использую по умолчанию: ON")
+        log_warn("", "AUTO_DEАКТИВATE не задан в .env → использую по умолчанию: ON")
     else:
         log_info("", f"AUTO_DEACTIVATE задан пользователем: {AUTO_DEACTIVATE_RAW} → эффективно: {AUTO_DEACTIVATE}")
 
-    log_info("", f"Итого настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, COOLDOWN={COOLDOWN_SECONDS}")
+    if ANONYMOUS_GIFTS_RAW is None:
+        log_warn("", "ANONYMOUS_GIFTS не задан в .env → использую по умолчанию: OFF (не анонимно)")
+    else:
+        log_info("", f"ANONYMOUS_GIFTS задан пользователем: {ANONYMOUS_GIFTS_RAW} → эффективно: {ANONYMOUS_GIFTS}")
+
+    log_info("", f"Итого настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, "
+                 f"ANONYMOUS_GIFTS={ANONYMOUS_GIFTS}, COOLDOWN={COOLDOWN_SECONDS}")
 
     account = Account(GOLDEN_KEY)
     account.get()
@@ -380,20 +436,21 @@ def main():
     runner = Runner(account)
     log_info("", "Ожидаю события от FunPay...")
 
-    last_reply_ts = 0.0
-
     for event in runner.listen(requests_delay=3.0):
         try:
             now = time.time()
-            if now - last_reply_ts < COOLDOWN_SECONDS:
-                continue
 
             if isinstance(event, NewOrderEvent):
                 order = account.get_order(event.order.id)
-                subcat_id, _ = get_subcategory_id_safe(order, account)
+                buyer_id = getattr(order, "buyer_id", None)
+                if buyer_id is None:
+                    continue
 
+                if now - _last_reply_by_buyer.get(buyer_id, 0.0) < COOLDOWN_SECONDS:
+                    continue
+
+                subcat_id, _ = get_subcategory_id_safe(order, account)
                 if subcat_id not in ALLOWED_CATEGORY_IDS:
-                    logger.debug(f"Пропуск заказа #{getattr(order,'id','?')}: subcat={subcat_id}")
                     continue
 
                 desc = (
@@ -404,7 +461,7 @@ def main():
                 )
                 gift_num = parse_gift_num(desc)
                 if not gift_num:
-                    ctx = f"Buyer {order.buyer_id} @{getattr(order, 'buyer_username', '')}"
+                    ctx = f"Buyer {buyer_id} @{getattr(order, 'buyer_username', '')}"
                     account.send_message(
                         order.chat_id,
                         "❌ В описании заказа отсутствует обязательный параметр gift_tg. "
@@ -416,20 +473,17 @@ def main():
                             refund_order(account, order.id, order.chat_id, ctx=ctx)
                         except Exception as e:
                             log_error(ctx, f"Ошибка при оформлении возврата: {short_text(e)}")
-                            logger.debug("Подробности ошибки возврата:", exc_info=True)
-                    else:
-                        account.send_message(order.chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
-                    last_reply_ts = now
+                    _last_reply_by_buyer[buyer_id] = now
                     continue
 
                 gift = GIFTS.get(gift_num)
                 if not gift:
                     account.send_message(order.chat_id, f"Номер gift_tg:{gift_num} отсутствует. Укажите корректный номер.")
-                    log_info(f"Buyer {order.buyer_id}", f"gift_tg:{gift_num} не найден в gifts.json.")
-                    last_reply_ts = now
+                    log_info(f"Buyer {buyer_id}", f"gift_tg:{gift_num} не найден в gifts.json.")
+                    _last_reply_by_buyer[buyer_id] = now
                     continue
 
-                waiting[order.buyer_id] = {
+                waiting[buyer_id] = {
                     "chat_id": order.chat_id,
                     "order_id": order.id,
                     "gift_num": gift_num,
@@ -444,13 +498,17 @@ def main():
                     f"Пришлите ваш Telegram-тег (пример: @username).",
                 )
                 log_info(pretty_order_context(order, gift=gift), "Ждём ник.")
-                last_reply_ts = now
+                _last_reply_by_buyer[buyer_id] = now
 
             elif isinstance(event, NewMessageEvent):
                 msg = event.message
                 chat_id = msg.chat_id
                 author_id = msg.author_id
                 text = (msg.text or "").strip()
+
+                if now - _last_reply_by_buyer.get(author_id, 0.0) < COOLDOWN_SECONDS:
+                    continue
+
                 if author_id == getattr(account, "id", None) or author_id not in waiting:
                     continue
 
@@ -461,17 +519,17 @@ def main():
                 if st["state"] == "awaiting_nick":
                     if not nick_looks_valid(text):
                         account.send_message(chat_id, "Неверный тег. Отправьте в виде @username (5–32 символа).")
-                        last_reply_ts = now
+                        _last_reply_by_buyer[author_id] = now
                         continue
                     st["temp_nick"] = text.strip()
                     st["state"] = "awaiting_confirmation"
                     account.send_message(
                         chat_id,
                         f'Вы указали {st["temp_nick"]} для получения {gift["title"]} ({gift["price"]}⭐).\n'
-                        f'Если верно — напишите "+"',
+                        f'Если верно — напишите "+"'
                     )
                     log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), "Ник получен — ждём подтверждение.")
-                    last_reply_ts = now
+                    _last_reply_by_buyer[author_id] = now
                     continue
 
                 if st["state"] == "awaiting_confirmation":
@@ -496,8 +554,6 @@ def main():
                         else:
                             full_err = str(info)
                             log_error(ctx, f"Полная ошибка отправки: {full_err}")
-                            logger.debug("Полная трассировка send_gift:", exc_info=True)
-
                             kind = classify_send_error(full_err)
 
                             if kind == "balance_low":
@@ -514,10 +570,8 @@ def main():
                                         refund_order(account, order_id, chat_id, ctx=ctx)
                                     except Exception as e:
                                         log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
-                                        logger.debug("Подробности возврата:", exc_info=True)
                                 else:
                                     account.send_message(chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
-
                             elif kind == "username_not_found":
                                 account.send_message(chat_id, "❌ Неверный ник или такой пользователь не найден.")
                                 log_warn(ctx, "USERNAME_NOT_OCCUPIED")
@@ -526,10 +580,11 @@ def main():
                                         refund_order(account, order_id, chat_id, ctx=ctx)
                                     except Exception as e:
                                         log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
-                                        logger.debug("Подробности возврата:", exc_info=True)
                                 else:
                                     account.send_message(chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
-
+                            elif kind == "flood":
+                                account.send_message(chat_id, "⚠️ Слишком много запросов. Выполню отправку чуть позже.")
+                                log_warn(ctx, "FLOOD_WAIT")
                             else:
                                 account.send_message(chat_id, "❌ Неизвестная ошибка при отправке подарка.")
                                 log_warn(ctx, "UNKNOWN_ERROR")
@@ -538,21 +593,18 @@ def main():
                                         refund_order(account, order_id, chat_id, ctx=ctx)
                                     except Exception as e:
                                         log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
-                                        logger.debug("Подробности возврата:", exc_info=True)
-                                else:
-                                    account.send_message(chat_id, "⚠️ Автоматический возврат выключен. Свяжитесь с админом для возврата.")
 
                         waiting.pop(author_id, None)
-                        last_reply_ts = now
+                        _last_reply_by_buyer[author_id] = now
                     else:
-                        if not nick_looks_valid(text):
-                            account.send_message(chat_id, "Неверный тег. Отправьте в виде @username.")
-                            last_reply_ts = now
-                            continue
-                        st["temp_nick"] = text.strip()
-                        account.send_message(chat_id, f'Обновлено: {st["temp_nick"]}. Если верно — напишите "+"')
-                        log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), f"Ник обновлён -> {st['temp_nick']}")
-                        last_reply_ts = now
+                        if nick_looks_valid(text):
+                            st["temp_nick"] = text.strip()
+                            account.send_message(chat_id, f'Ник обновлён: {st["temp_nick"]}. Если верно — напишите "+".')
+                            log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), f"Ник обновлён -> {st['temp_nick']}")
+                        else:
+                            account.send_message(chat_id, "Для подтверждения отправьте «+». Либо пришлите новый ник @username.")
+                        _last_reply_by_buyer[author_id] = now
+                        continue
 
         except Exception as e:
             log_error("", f"Ошибка обработки события: {short_text(e)}")
