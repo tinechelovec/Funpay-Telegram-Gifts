@@ -18,12 +18,31 @@ if not API_ID or not API_HASH:
 
 API_ID = int(API_ID)
 
+TIMEOUT = 30
+WARNING = "⚠️ Нет ответа 30 секунд. Попробуйте синхронизировать время на ПК и перезапустить скрипт."
+
 async def main():
-    async with Client("stars", api_id=API_ID, api_hash=API_HASH, workdir="sessions") as app:
-        me = await app.get_me()
-        bal = await app.get_stars_balance()
+    app = Client("stars", api_id=API_ID, api_hash=API_HASH, workdir="sessions")
+    started = False
+    try:
+
+        await asyncio.wait_for(app.start(), timeout=TIMEOUT)
+        started = True
+
+        me = await asyncio.wait_for(app.get_me(), timeout=TIMEOUT)
+        bal = await asyncio.wait_for(app.get_stars_balance(), timeout=TIMEOUT)
+
         print(f"✅ Успешно вошли как {me.first_name} (ID: {me.id})")
         print(f"🌟 Текущий баланс звёзд: {bal}")
+
+    except asyncio.TimeoutError:
+        print(WARNING)
+    finally:
+        if started:
+            try:
+                await app.stop()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     asyncio.run(main())
