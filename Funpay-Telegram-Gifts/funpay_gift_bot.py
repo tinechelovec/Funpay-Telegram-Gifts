@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import colorlog
+from contextlib import suppress
 from typing import Optional, Tuple, List, Any, Dict
 
 from dotenv import load_dotenv
@@ -79,8 +80,11 @@ BANNER_NOTE = os.getenv(
 LOG_NAME = "FunPay-Gifts"
 
 try:
-    handler = colorlog.StreamHandler()
-    color_formatter = colorlog.ColoredFormatter(
+    logger = colorlog.getLogger(LOG_NAME)
+    logger.setLevel(logging.INFO)
+
+    console_handler = colorlog.StreamHandler()
+    console_formatter = colorlog.ColoredFormatter(
         fmt="%(log_color)s[%(levelname)-5s]%(reset)s %(blue)s" + LOG_NAME + "%(reset)s: %(message)s",
         log_colors={
             "DEBUG": "cyan",
@@ -90,17 +94,35 @@ try:
             "CRITICAL": "red,bg_white",
         },
     )
-    handler.setFormatter(color_formatter)
-    logger = colorlog.getLogger(LOG_NAME)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-except Exception:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)-5s] " + LOG_NAME + ": %(message)s",
+    console_handler.setFormatter(console_formatter)
+
+    file_handler = logging.FileHandler("log.txt", mode="a", encoding="utf-8")
+    file_formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)-5s] " + LOG_NAME + ": %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    file_handler.setFormatter(file_formatter)
+
+    logger.handlers.clear()
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+
+except Exception:
     logger = logging.getLogger(LOG_NAME)
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)-5s] " + LOG_NAME + ": %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    fh = logging.FileHandler("log.txt", mode="a", encoding="utf-8")
+    fh.setFormatter(formatter)
+
+    logger.handlers.clear()
+    logger.addHandler(ch)
+    logger.addHandler(fh)
 
 RED = "\033[31m"
 BRIGHT_CYAN = "\033[96m"
@@ -144,11 +166,15 @@ loop = asyncio.new_event_loop()
 app: Optional[Client] = None
 _app_started = threading.Event()
 
+_pyro_gate = threading.Semaphore(1)
+_restarts = 0
+
 def _build_client() -> Client:
+    common = dict(workdir="sessions", no_updates=True)
     if API_ID and API_HASH:
-        return Client("stars", api_id=API_ID, api_hash=API_HASH, workdir="sessions")
+        return Client("stars", api_id=API_ID, api_hash=API_HASH, **common)
     else:
-        return Client("stars", workdir="sessions")
+        return Client("stars", **common)
 
 async def _runner_start():
     global app
@@ -161,6 +187,42 @@ def _thread_target():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(_runner_start())
     loop.run_forever()
+
+async def _ping_pyro() -> bool:
+    try:
+        await app.get_me()
+        return True
+    except Exception:
+        return False
+
+async def _restart_pyro_once():
+    with suppress(Exception):
+        await app.stop()
+    await asyncio.sleep(0.2)
+    await app.start()
+    log_warn("pyro", "Pyrogram перезапущен")
+
+def _ensure_pyro_alive_sync() -> bool:
+    if app is None:
+        return False
+    fut = asyncio.run_coroutine_threadsafe(_ping_pyro(), loop)
+    try:
+        ok = fut.result(timeout=5.0)
+    except Exception:
+        ok = False
+    if ok:
+        return True
+    
+    global _restarts
+    _restarts += 1
+    fut2 = asyncio.run_coroutine_threadsafe(_restart_pyro_once(), loop)
+    with suppress(Exception):
+        fut2.result(timeout=20.0)
+    fut3 = asyncio.run_coroutine_threadsafe(_ping_pyro(), loop)
+    try:
+        return fut3.result(timeout=5.0)
+    except Exception:
+        return False
 
 _log_banner_red()
 threading.Thread(target=_thread_target, daemon=True).start()
@@ -282,7 +344,7 @@ def expand_assignment(recipients: List[str], qty: int) -> List[str]:
         i += 1
     return out
 
-async def _get_stars_balance_once() -> int:
+async def _get_stars_balance_once() -> Optional[int]:
     try:
         bal = await app.get_stars_balance()
         if isinstance(bal, (int, float)):
@@ -294,23 +356,24 @@ async def _get_stars_balance_once() -> int:
                         return int(bal[k])
                     except Exception:
                         pass
-        try:
-            return int(bal)
-        except Exception:
-            return 0
+        return int(bal)
     except Exception as e:
         logger.debug(f"get_stars_balance failed: {e}", exc_info=True)
-        return 0
+        return None
 
-def get_stars_balance_sync(timeout: float = 10.0) -> int:
+def get_stars_balance_sync(timeout: float = 10.0) -> Optional[int]:
     if app is None:
-        return 0
-    fut = asyncio.run_coroutine_threadsafe(_get_stars_balance_once(), loop)
-    try:
-        return fut.result(timeout=timeout)
-    except Exception as e:
-        logger.debug(f"get_stars_balance_sync error: {e}", exc_info=True)
-        return 0
+        return None
+    if not _ensure_pyro_alive_sync():
+        return None
+    with _pyro_gate:
+        fut = asyncio.run_coroutine_threadsafe(_get_stars_balance_once(), loop)
+        try:
+            res = fut.result(timeout=timeout)
+            return res if isinstance(res, int) and res >= 0 else None
+        except Exception as e:
+            logger.debug(f"get_stars_balance_sync error: {e}", exc_info=True)
+            return None
 
 def try_partial_refund(account: Account, order_id: int, units: int, gift: dict, chat_id: int, ctx: str = "") -> bool:
     total_stars = int(units) * int(gift.get("price", 0))
@@ -383,12 +446,15 @@ async def _send_gift_once(username: str, gift_id: int) -> bool:
 def send_gift_sync(username: str, gift_id: int, timeout: float = 30.0) -> Tuple[bool, str]:
     if app is None:
         return False, "Pyrogram app is not started"
-    fut = asyncio.run_coroutine_threadsafe(_send_gift_once(username, gift_id), loop)
-    try:
-        res = fut.result(timeout=timeout)
-        return True, str(res)
-    except Exception as e:
-        return False, str(e)
+    if not _ensure_pyro_alive_sync():
+        return False, "Pyrogram not connected"
+    with _pyro_gate:
+        fut = asyncio.run_coroutine_threadsafe(_send_gift_once(username, gift_id), loop)
+        try:
+            res = fut.result(timeout=timeout)
+            return True, str(res)
+        except Exception as e:
+            return False, str(e)
 
 def refund_order(account: Account, order_id: int, chat_id: int, ctx: str = "") -> bool:
     try:
@@ -495,6 +561,9 @@ def classify_send_error(info: str) -> str:
         return "username_not_found"
     if "flood" in lower or "too many requests" in lower or "slowmode" in lower:
         return "flood"
+    if "connection lost" in lower or "socket.send()" in lower or "noneType' object has no attribute 'read'" in lower \
+       or "read() called while another coroutine" in lower:
+        return "network"
     return "other"
 
 def main():
@@ -518,7 +587,7 @@ def main():
     if ANONYMOUS_GIFTS_RAW is None:
         log_warn("", "ANONYMOUS_GIFTS не задан в .env → использую по умолчанию: OFF (не анонимно)")
     else:
-        log_info("", f"ANONYMOUS_GIFTS задан пользователем: {ANONYMOUS_GIFTS_RAW} → эффективно: {ANONYMOUS_GIFTS}")
+        log_info("", f"ANONYMOUS_GИFTS задан пользователем: {ANONYMOUS_GIFTS_RAW} → эффективно: {ANONYMOUS_GIFTS}")
 
     log_info("", f"Итого настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, "
                  f"ANONYMOUS_GIFTS={ANONYMOUS_GIFTS}, COOLDOWN={COOLDOWN_SECONDS}")
@@ -595,7 +664,7 @@ def main():
 
                 need_all = price * qty
                 bal = get_stars_balance_sync()
-                if bal < need_all:
+                if isinstance(bal, int) and bal < need_all:
                     if AUTO_REFUND:
                         account.send_message(
                             order.chat_id,
@@ -621,6 +690,12 @@ def main():
                             log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
                     _last_reply_by_buyer[buyer_id] = now
                     continue
+                elif bal is None:
+                    account.send_message(
+                        order.chat_id,
+                        "⚠️ Временная ошибка связи с Telegram Stars — проверка баланса недоступна. "
+                        "Продолжаю обработку заказа; если звёзд не хватит при отправке — сообщу отдельно."
+                    )
 
                 waiting[buyer_id] = {
                     "chat_id": order.chat_id,
@@ -722,6 +797,10 @@ def main():
                                 elif kind == "username_not_found":
                                     if AUTO_REFUND:
                                         try_partial_refund(account, order_id, 1, gift, chat_id, ctx=ctx)
+                                elif kind == "network":
+                                    account.send_message(chat_id, "⚠️ Проблема с соединением с Telegram. Выдачу остановил; попробуйте позже.")
+                                    _ensure_pyro_alive_sync()
+                                    break
                                 else:
                                     pass
 
