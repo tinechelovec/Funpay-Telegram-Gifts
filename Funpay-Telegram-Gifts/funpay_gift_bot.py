@@ -69,7 +69,7 @@ ANONYMOUS_GIFTS = _env_bool("ANONYMOUS_GIFTS", False)
 CREATOR_NAME = os.getenv("CREATOR_NAME", "@tinechelovec")
 CREATOR_URL = os.getenv("CREATOR_URL", "https://t.me/tinechelovec")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/by_thc")
-GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/tinechelovec/Funpay-Telegram-Premium")
+GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/tinechelovec/Funpay-Telegram-Gifts")
 BANNER_NOTE = os.getenv(
     "BANNER_NOTE",
     "Бот бесплатный и с открытым исходным кодом на GitHub. "
@@ -168,6 +168,7 @@ _app_started = threading.Event()
 
 _pyro_gate = threading.Semaphore(1)
 _restarts = 0
+_completed_buyers: set[int] = set()
 
 def _build_client() -> Client:
     common = dict(workdir="sessions", no_updates=True)
@@ -587,7 +588,7 @@ def main():
     if ANONYMOUS_GIFTS_RAW is None:
         log_warn("", "ANONYMOUS_GIFTS не задан в .env → использую по умолчанию: OFF (не анонимно)")
     else:
-        log_info("", f"ANONYMOUS_GИFTS задан пользователем: {ANONYMOUS_GIFTS_RAW} → эффективно: {ANONYMOUS_GIFTS}")
+        log_info("", f"ANONYMOUS_GIFTS задан пользователем: {ANONYMOUS_GIFTS_RAW} → эффективно: {ANONYMOUS_GIFTS}")
 
     log_info("", f"Итого настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, "
                  f"ANONYMOUS_GIFTS={ANONYMOUS_GIFTS}, COOLDOWN={COOLDOWN_SECONDS}")
@@ -611,6 +612,9 @@ def main():
                 buyer_id = getattr(order, "buyer_id", None)
                 if buyer_id is None:
                     continue
+
+                _completed_buyers.discard(buyer_id)
+
                 if now - _last_reply_by_buyer.get(buyer_id, 0.0) < COOLDOWN_SECONDS:
                     continue
 
@@ -625,20 +629,10 @@ def main():
                     or ""
                 )
                 gift_num = parse_gift_num(desc)
+
                 if not gift_num:
                     ctx = f"Buyer {buyer_id} @{getattr(order, 'buyer_username', '')}"
-                    account.send_message(
-                        order.chat_id,
-                        "❌ В описании заказа отсутствует обязательный параметр gift_tg. "
-                        "Произошла ошибка при обработке заказа — сейчас оформляем возврат средств.",
-                    )
-                    log_warn(ctx, "Отсутствует gift_tg в описании → возврат (если включён)")
-                    if AUTO_REFUND:
-                        try:
-                            refund_order(account, order.id, order.chat_id, ctx=ctx)
-                        except Exception as e:
-                            log_error(ctx, f"Ошибка при оформлении возврата: {short_text(e)}")
-                    _last_reply_by_buyer[buyer_id] = now
+                    log_error(ctx, "❌ Отсутствует обязательный параметр gift_tg в описании заказа. Заказ пропущен без ответа в чат.")
                     continue
 
                 gift = GIFTS.get(gift_num)
@@ -725,6 +719,9 @@ def main():
                 author_id = msg.author_id
                 text = (msg.text or "").strip()
 
+                if author_id in _completed_buyers:
+                    continue
+
                 if now - _last_reply_by_buyer.get(author_id, 0.0) < COOLDOWN_SECONDS:
                     continue
                 if author_id == getattr(account, "id", None) or author_id not in waiting:
@@ -806,6 +803,8 @@ def main():
 
                         if sent > 0:
                             account.send_message(chat_id, f"🎉 Успешно отправлено: {sent} шт.")
+                            _completed_buyers.add(author_id)
+
                         if failed_units > 0:
                             account.send_message(chat_id, f"⚠️ Не удалось отправить: {failed_units} шт. Причины: {', '.join(set(failed_reasons))}")
 
