@@ -15,6 +15,12 @@ from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 
+try:
+    from gift_sets import resolve_to_gift_ids, get_required_stars, load_sets
+    GIFT_SETS_AVAILABLE = True
+except Exception:
+    GIFT_SETS_AVAILABLE = False
+
 if not hasattr(Client, "send_gift"):
     raise RuntimeError(
         "Установлен неподдерживаемый пакет 'pyrogram'. Нужен форк с поддержкой Stars.\n"
@@ -567,6 +573,35 @@ def classify_send_error(info: str) -> str:
         return "network"
     return "other"
 
+def resolve_item(key: str) -> Tuple[List[int], int, str, bool]:
+    key_s = str(key)
+
+    if GIFT_SETS_AVAILABLE:
+        try:
+            ids = [int(x) for x in resolve_to_gift_ids(key_s)]
+            price = int(get_required_stars(key_s))
+            is_bundle = int(key_s) >= 12 and len(ids) > 1
+
+            title = None
+            if is_bundle:
+                try:
+                    s = load_sets().get(key_s)
+                    title = getattr(s, "title", None) or f"Набор #{key_s}"
+                except Exception:
+                    title = f"Набор #{key_s}"
+            else:
+                title = GIFTS.get(key_s, {}).get("title", f"Подарок #{key_s}")
+
+            return ids, price, title, is_bundle
+        except Exception:
+            pass
+
+    g = GIFTS.get(key_s)
+    if not g:
+        raise KeyError("not_found")
+
+    return [int(g["id"])], int(g.get("price", 0)), g.get("title", f"Подарок #{key_s}"), False
+
 def main():
     if not GOLDEN_KEY:
         log_error("", "В .env должен быть FUNPAY_AUTH_TOKEN")
@@ -635,22 +670,20 @@ def main():
                     log_error(ctx, "❌ Отсутствует обязательный параметр gift_tg в описании заказа. Заказ пропущен без ответа в чат.")
                     continue
 
-                gift = GIFTS.get(gift_num)
-                if not gift:
+                try:
+                    ids_per_unit, price_per_unit, item_title, is_bundle = resolve_item(gift_num)
+                except KeyError:
                     account.send_message(order.chat_id, f"Номер gift_tg:{gift_num} отсутствует. Укажите корректный номер.")
-                    log_info(f"Buyer {buyer_id}", f"gift_tg:{gift_num} не найден в gifts.json.")
+                    log_info(f"Buyer {buyer_id}", f"gift_tg:{gift_num} не найден ни в gifts.json, ни в наборах.")
                     _last_reply_by_buyer[buyer_id] = now
                     continue
 
                 qty = parse_quantity(order, desc)
-                try:
-                    price = int(gift["price"])
-                except Exception:
-                    price = 0
+                price = int(price_per_unit)
 
                 if price <= 0 or qty <= 0:
-                    account.send_message(order.chat_id, "❌ Неверная конфигурация подарка или количества. Оформляю возврат.")
-                    ctx = pretty_order_context(order, gift=gift)
+                    account.send_message(order.chat_id, "❌ Неверная конфигурация товара или количества. Оформляю возврат.")
+                    ctx = pretty_order_context(order, gift={"title": item_title, "price": price, "id": ids_per_unit[0] if ids_per_unit else "?"})
                     if AUTO_REFUND:
                         refund_order(account, order.id, order.chat_id, ctx=ctx)
                     _last_reply_by_buyer[buyer_id] = now
@@ -660,28 +693,26 @@ def main():
                 bal = get_stars_balance_sync()
                 if isinstance(bal, int) and bal < need_all:
                     if AUTO_REFUND:
-                        account.send_message(
-                            order.chat_id,
-                            "❌ У продавца недостаточно средств.\nСейчас оформлю полный возврат заказа."
-                        )
+                        account.send_message(order.chat_id, "❌ У продавца недостаточно средств.\nСейчас оформлю полный возврат заказа.")
                     else:
-                        account.send_message(
-                            order.chat_id,
-                            "❌ У продавца недостаточно средств.\nОжидайте ответа продавца."
-                        )
-                    ctx = pretty_order_context(order, gift=gift)
+                        account.send_message(order.chat_id, "❌ У продавца недостаточно средств.\nОжидайте ответа продавца.")
+
+                    ctx = pretty_order_context(order, gift={"title": item_title, "price": price, "id": ids_per_unit[0] if ids_per_unit else "?"})
                     log_warn(ctx, f"BALANCE_TOO_LOW pre-check @NewOrder: bal={bal}, need_all={need_all}, qty={qty}")
+
                     if AUTO_DEACTIVATE:
                         for cid in CATEGORY_IDS_LIST:
                             try:
                                 deactivate_lots(account, cid)
                             except Exception as e:
                                 log_error(ctx, f"Ошибка деактивации в {cid}: {e}")
+
                     if AUTO_REFUND:
                         try:
                             refund_order(account, order.id, order.chat_id, ctx=ctx)
                         except Exception as e:
                             log_error(ctx, f"Ошибка при возврате: {short_text(e)}")
+
                     _last_reply_by_buyer[buyer_id] = now
                     continue
                 elif bal is None:
@@ -695,7 +726,10 @@ def main():
                     "chat_id": order.chat_id,
                     "order_id": order.id,
                     "gift_num": gift_num,
-                    "gift": gift,
+                    "gift_title": item_title,
+                    "ids_per_unit": ids_per_unit,
+                    "price": price,
+                    "is_bundle": is_bundle,
                     "state": "awaiting_nicks",
                     "recipients": [],
                     "qty": qty,
@@ -704,14 +738,18 @@ def main():
                 account.send_message(
                     order.chat_id,
                     (
-                        f"Спасибо за покупку! К выдаче: {gift['title']} ×{qty} по {gift['price']}⭐.\n"
+                        f"Спасибо за покупку! К выдаче: {item_title} ×{qty} по {price}⭐.\n"
                         "Пришлите теги получателей:\n"
-                        "• один @username — тогда все подарки уйдут ему\n"
+                        "• один @username — тогда вся единица (набор/подарок) уйдёт ему\n"
                         "• или список через запятую/пробел/перенос: @u1, @u2, @u3"
                     ),
                 )
-                log_info(pretty_order_context(order, gift=gift), f"Ждём ники. qty={qty}, need_all={need_all}, bal={bal}")
+                log_info(
+                    pretty_order_context(order, gift={"title": item_title, "price": price, "id": ids_per_unit[0] if ids_per_unit else "?"}),
+                    f"Ждём ники. qty={qty}, need_all={need_all}, bal={bal}"
+                )
                 _last_reply_by_buyer[buyer_id] = now
+                continue
 
             elif isinstance(event, NewMessageEvent):
                 msg = event.message
@@ -728,7 +766,6 @@ def main():
                     continue
 
                 st = waiting[author_id]
-                gift = st["gift"]
                 order_id = st["order_id"]
 
                 if st["state"] == "awaiting_nicks":
@@ -747,10 +784,9 @@ def main():
                     st["state"] = "awaiting_confirmation"
                     account.send_message(
                         chat_id,
-                        f"План выдачи: {gift['title']} — {plan}. Если верно — напишите \"+\".\n"
+                        f"План выдачи: {st.get('gift_title', 'товар')} — {plan}. Если верно — напишите \"+\".\n"
                         "Или пришлите новый список получателей."
                     )
-                    log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), f"Получатели: {plan}")
                     _last_reply_by_buyer[author_id] = now
                     continue
 
@@ -760,31 +796,38 @@ def main():
                         qty = int(st.get("qty", 1))
                         assign = expand_assignment(recipients, qty) if recipients else []
 
-                        account.send_message(chat_id, f"Отправляю {gift['title']} — всего {qty} шт.")
-                        ctx = pretty_order_context(None, buyer_id=author_id, gift=gift)
+                        item_title = st.get("gift_title", "товар")
+                        ids_per_unit = list(st.get("ids_per_unit") or [])
+                        price = int(st.get("price", 0))
 
-                        sent = 0
+                        account.send_message(chat_id, f"Отправляю {item_title} — всего {qty} шт.")
+                        ctx = pretty_order_context(None, buyer_id=author_id, gift={"title": item_title, "price": price, "id": ids_per_unit[0] if ids_per_unit else "?"})
+
+                        sent_units = 0
                         failed_units = 0
                         failed_reasons: List[str] = []
 
                         for i in range(qty):
                             username = assign[i]
-                            ok, info = send_gift_sync(username, gift_id=gift["id"])
-                            if ok:
-                                sent += 1
-                                time.sleep(0.25)
-                                log_info(ctx, f"УСПЕХ -> {username} [{sent}/{qty}]")
-                            else:
+                            unit_ok = True
+
+                            for gid in ids_per_unit:
+                                ok, info = send_gift_sync(username, gift_id=gid)
+                                if ok:
+                                    time.sleep(0.25)
+                                    log_info(ctx, f"УСПЕХ -> {username} [unit {i+1}/{qty}] part={gid}")
+                                    continue
+
                                 kind = classify_send_error(str(info))
-                                failed_units += 1
                                 failed_reasons.append(kind)
+                                unit_ok = False
                                 log_warn(ctx, f"FAIL -> {username}: {kind} :: {short_text(info)}")
 
                                 if kind == "balance_low":
                                     account.send_message(
                                         chat_id,
                                         "⚠️ Во время отправки выяснилось, что у продавца недостаточно средств. "
-                                        "Часть подарков отправлена; по остальным — пополните звёзды и оформите новый заказ "
+                                        "Часть отправлена; по остальным — пополните звёзды и оформите новый заказ "
                                         "или ожидайте ответа продавца."
                                     )
                                     break
@@ -793,16 +836,24 @@ def main():
                                     break
                                 elif kind == "username_not_found":
                                     if AUTO_REFUND:
-                                        try_partial_refund(account, order_id, 1, gift, chat_id, ctx=ctx)
+                                        try_partial_refund(account, order_id, 1, {"price": price, "title": item_title}, chat_id, ctx=ctx)
+                                    break
                                 elif kind == "network":
                                     account.send_message(chat_id, "⚠️ Проблема с соединением с Telegram. Выдачу остановил; попробуйте позже.")
                                     _ensure_pyro_alive_sync()
                                     break
                                 else:
-                                    pass
+                                    break
 
-                        if sent > 0:
-                            account.send_message(chat_id, f"🎉 Успешно отправлено: {sent} шт.")
+                            if unit_ok:
+                                sent_units += 1
+                            else:
+                                failed_units += 1
+                                if failed_reasons and failed_reasons[-1] in ("balance_low", "flood", "network"):
+                                    break
+
+                        if sent_units > 0:
+                            account.send_message(chat_id, f"🎉 Успешно отправлено: {sent_units} шт.")
                             _completed_buyers.add(author_id)
 
                         if failed_units > 0:
@@ -824,7 +875,6 @@ def main():
                                 preview[u] = preview.get(u, 0) + 1
                             plan = ", ".join([f"{u} ×{c}" for u, c in preview.items()])
                             account.send_message(chat_id, f"План обновлён: {plan}. Для подтверждения отправьте \"+\".")
-                            log_info(pretty_order_context(None, buyer_id=author_id, gift=gift), f"План обновлён: {plan}")
                         else:
                             account.send_message(chat_id, "Для подтверждения отправьте «+». Либо пришлите новый список получателей.")
                         _last_reply_by_buyer[author_id] = now
