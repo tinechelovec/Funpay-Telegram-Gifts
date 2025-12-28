@@ -1,8 +1,16 @@
 import asyncio
 import os
+import getpass
 from dotenv import load_dotenv
-from pyrogram import Client, filters
-from pyrogram.handlers import MessageHandler
+
+from pyrogram import Client
+from pyrogram.errors import (
+    SessionPasswordNeeded,
+    PhoneNumberInvalid,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    PhoneNumberUnoccupied,
+)
 
 if not hasattr(Client, "send_gift"):
     raise RuntimeError(
@@ -19,52 +27,88 @@ if not API_ID or not API_HASH:
 
 API_ID = int(API_ID)
 
-TIMEOUT = 30
-WARNING = "⚠️ Нет ответа 30 секунд. Попробуйте синхронизировать время на ПК и перезапустить скрипт."
 
-async def wait_first_message(app: Client, timeout: int) -> bool:
-    first_msg_event = asyncio.Event()
+def ask_phone() -> str:
+    print("Привет! Это файл для создания сессии.")
+    print("Чтобы создать сессию, нужно ввести номер телефона от Telegram.\n")
 
-    async def on_msg(_, __):
-        if not first_msg_event.is_set():
-            first_msg_event.set()
+    while True:
+        phone = input("📱 Введите номер телефона (пример: +79991234567): ").strip()
+        phone = phone.replace(" ", "")
+        if not phone:
+            print("❌ Номер не может быть пустым.\n")
+            continue
 
-    handler = MessageHandler(on_msg, filters.incoming)
-    app.add_handler(handler)
+        confirm = input(f"Вы ввели номер: {phone}. Это верно? (да/нет): ").strip().lower()
+        if confirm in ("да", "д", "y", "yes"):
+            return phone
+        print("Ок, давайте введём номер заново.\n")
 
-    try:
-        await asyncio.wait_for(first_msg_event.wait(), timeout=timeout)
-        return True
-    except asyncio.TimeoutError:
-        return False
-    finally:
-        app.remove_handler(handler)
+
+def ask_code() -> str:
+    while True:
+        code = input("🔐 Введите код из Telegram: ").strip().replace(" ", "")
+        if code:
+            return code
+        print("❌ Код не может быть пустым.\n")
+
 
 async def main():
     app = Client("stars", api_id=API_ID, api_hash=API_HASH, workdir="sessions")
-    started = False
+
+    await app.connect()
+
     try:
-        await asyncio.wait_for(app.start(), timeout=TIMEOUT)
-        started = True
+        me = await app.get_me()
+        bal = await app.get_stars_balance()
+        username = f"@{me.username}" if me.username else f"{me.first_name} (без username)"
+        print("✅ Сессия уже существует (вход выполнен).")
+        print(f"👤 Аккаунт: {username} | ID: {me.id}")
+        print(f"🌟 Кол-во звёзд: {bal}")
+        await app.disconnect()
+        return
+    except Exception:
+        pass
 
-        got_first = await wait_first_message(app, TIMEOUT)
-        if not got_first:
-            print(WARNING)
+    phone = ask_phone()
 
-        me = await asyncio.wait_for(app.get_me(), timeout=TIMEOUT)
-        bal = await asyncio.wait_for(app.get_stars_balance(), timeout=TIMEOUT)
+    try:
+        sent = await app.send_code(phone)
+    except PhoneNumberInvalid:
+        print("❌ Неверный формат номера телефона. Перезапустите и введите номер правильно.")
+        await app.disconnect()
+        return
+    except PhoneNumberUnoccupied:
+        print("❌ Этот номер не зарегистрирован в Telegram.")
+        await app.disconnect()
+        return
 
-        print(f"✅ Успешно вошли как {me.first_name} (ID: {me.id})")
-        print(f"🌟 Текущий баланс звёзд: {bal}")
+    code = ask_code()
 
-    except asyncio.TimeoutError:
-        print("⚠️ Нет ответа 30 секунд. Попробуйте синхронизировать время на ПК и перезапустить скрипт.")
-    finally:
-        if started:
-            try:
-                await app.stop()
-            except Exception:
-                pass
+    try:
+        await app.sign_in(phone_number=phone, phone_code_hash=sent.phone_code_hash, phone_code=code)
+    except PhoneCodeInvalid:
+        print("❌ Код неверный. Перезапустите скрипт и попробуйте снова.")
+        await app.disconnect()
+        return
+    except PhoneCodeExpired:
+        print("❌ Код устарел. Перезапустите скрипт и запросите новый код.")
+        await app.disconnect()
+        return
+    except SessionPasswordNeeded:
+        pwd = getpass.getpass("🔒 Включена двухэтапная проверка (2FA). Введите пароль: ")
+        await app.check_password(pwd)
+
+    me = await app.get_me()
+    bal = await app.get_stars_balance()
+
+    username = f"@{me.username}" if me.username else f"{me.first_name} (без username)"
+    print("\n✅ Сессия успешно создана и сохранена в папке sessions.")
+    print(f"👤 Ник/аккаунт: {username} | ID: {me.id}")
+    print(f"🌟 Кол-во звёзд: {bal}")
+
+    await app.disconnect()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
