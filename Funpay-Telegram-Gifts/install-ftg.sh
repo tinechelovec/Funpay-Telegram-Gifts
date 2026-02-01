@@ -119,8 +119,13 @@ if [[ -z "${BOT_FILE}" ]]; then
   exit 4
 fi
 
+SETTINGS_FILE="$(find "${CODE_DIR}" -maxdepth 1 -type f -name "settings.py" -print -quit || true)"
+
 echo "Код: ${CODE_DIR}"
 echo "Бот: ${BOT_FILE}"
+if [[ -n "${SETTINGS_FILE}" ]]; then
+  echo "Настройки: ${SETTINGS_FILE}"
+fi
 
 echo "[3/6] Создаю venv и ставлю зависимости..."
 "${PYBIN}" -m venv "${VENV_DIR}"
@@ -204,6 +209,23 @@ echo "  sudo journalctl -u ${SVC_BASE}@${INSTANCE} -f"
 echo
 echo "Для добавления в автозагрузку:"
 echo "  sudo systemctl enable ${SVC_BASE}@${INSTANCE}"
+echo
+
+if [[ -n "${SETTINGS_FILE}" ]]; then
+  echo "Чтобы зайти в настройки бота (settings.py):"
+  echo "  sudo -u ${BOT_USER} -H bash -lc \"cd '${CODE_DIR}' && '${VENV_DIR}/bin/python' settings.py\""
+  echo
+else
+  echo "settings.py не найден рядом с кодом (${CODE_DIR})."
+  echo
+fi
+
+echo "Для запуска/повторного запуска первичной настройки (first_start.py):"
+echo "  sudo -u ${BOT_USER} -H bash -lc \"cd '${CODE_DIR}' && '${VENV_DIR}/bin/python' first_start.py\""
+echo "  (можно добавить опции: --set KEY=VALUE, --force-env, --non-interactive)"
+echo
+echo "Для ручного запуска бота (без systemd, для теста):"
+echo "  sudo -u ${BOT_USER} -H bash -lc \"cd '${CODE_DIR}' && '${VENV_DIR}/bin/python' '${BOT_FILE}'\""
 echo
 echo "❗Перед enable убедись, что бот работает корректно."
 echo "############################################################"
