@@ -193,6 +193,10 @@ USERNAME_CACHE_TTL = float(os.getenv("USERNAME_CACHE_TTL", "86400"))
 FLOODWAIT_EXTRA_SLEEP = float(os.getenv("FLOODWAIT_EXTRA_SLEEP", "0.30"))
 SPAMBLOCK_PAUSE_SECONDS = float(os.getenv("SPAMBLOCK_PAUSE_SECONDS", "21600"))
 AUTO_DEACTIVATE_ON_FLOODWAIT = _env_bool("AUTO_DEACTIVATE_ON_FLOODWAIT", False)
+AUTO_RAISE_LOTS = _env_bool("AUTO_RAISE_LOTS", True)
+AUTO_RAISE_INTERVAL_SECONDS = float(os.getenv("AUTO_RAISE_INTERVAL_SECONDS", "330"))
+AUTO_RAISE_JITTER_SECONDS = float(os.getenv("AUTO_RAISE_JITTER_SECONDS", "30"))
+_auto_raise_stop = threading.Event()
 FLOOD_DEACTIVATE_COOLDOWN = float(os.getenv("FLOOD_DEACTIVATE_COOLDOWN", "900"))
 TG_SESSIONS_RAW = (_env_raw("TG_SESSIONS") or _env_raw("TG_SESSION_NAMES") or "").strip()
 TG_PRIMARY_SESSION = (_env_raw("TG_PRIMARY_SESSION") or "stars").strip() or "stars"
@@ -246,12 +250,12 @@ def _parse_id_list(val: Optional[str], default: str = "3064,2418") -> Tuple[List
         ok = [3064, 2418]
     return ok, bad, raw
 
-lock_branding()
-
 RAW_IDS = os.getenv("CATEGORY_IDS") or os.getenv("CATEGORY_ID")
 CATEGORY_IDS_LIST, BAD_TOKENS, RAW_IDS_STR = _parse_id_list(RAW_IDS)
 ALLOWED_CATEGORY_IDS = set(CATEGORY_IDS_LIST)
 PRIMARY_CATEGORY_ID = CATEGORY_IDS_LIST[0]
+AUTO_RAISE_CATEGORY_IDS_RAW = _env_raw("AUTO_RAISE_CATEGORY_IDS")
+AUTO_RAISE_SUBCATS_LIST, AUTO_RAISE_BAD_TOKENS, _AUTO_RAISE_RAW = _parse_id_list(AUTO_RAISE_CATEGORY_IDS_RAW,default=RAW_IDS_STR)
 
 COOLDOWN_SECONDS = float(os.getenv("REPLY_COOLDOWN_SECONDS", "1.0"))
 AUTO_REFUND_RAW = _env_raw("AUTO_REFUND")
@@ -295,7 +299,7 @@ def _norm_param_key(s: str) -> str:
 
 GIFT_PARAM_KEY_NORM = _norm_param_key(GIFT_PARAM_KEY)
 
-CREATOR_NAME = os.getenv("CREATOR_NAME", "@dadadadwada")
+CREATOR_NAME = os.getenv("CREATOR_NAME", "@tinechelovec") #раньше здесь был dadadadwada, бедный dadadadwada земля тебе плейрок
 CREATOR_URL = os.getenv("CREATOR_URL", "https://t.me/tinechelovec")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/by_thc")
 GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/tinechelovec/Funpay-Telegram-Gifts")
@@ -752,6 +756,122 @@ def _handle_network(idx: int, username: str, gift_id: int, exc: Optional[Excepti
             TG_MANAGER.limiters[idx].pause(float(TG_FAILOVER_NETWORK_PAUSE))
     log_warn("tg", f"NETWORK session={TG_MANAGER.session_names[idx] if TG_MANAGER else idx} to=@{username.lstrip('@')} gift_id={gift_id} :: {short_text(exc)}")
 
+from contextlib import suppress
+
+def _build_subcat_to_cat_map(account: Account) -> Dict[int, int]:
+    mapping: Dict[int, int] = {}
+    try:
+        if not getattr(account, "is_initiated", False):
+            with suppress(Exception):
+                account.get()
+
+        cats = getattr(account, "categories", None)
+        if not isinstance(cats, list) or not cats:
+            with suppress(Exception):
+                d = account.get_sorted_categories()
+                if isinstance(d, dict):
+                    cats = list(d.values())
+
+        for cat in (cats or []):
+            cid = getattr(cat, "id", None)
+            if cid is None:
+                continue
+
+            subs = (
+                getattr(cat, "subcategories", None)
+                or getattr(cat, "sub_categories", None)
+                or []
+            )
+            for sub in (subs or []):
+                sid = getattr(sub, "id", None)
+                if sid is None:
+                    continue
+                mapping[int(sid)] = int(cid)
+
+        if not mapping:
+            subs_all = getattr(account, "subcategories", None)
+            if isinstance(subs_all, list):
+                for sub in subs_all:
+                    sid = getattr(sub, "id", None)
+                    cat = getattr(sub, "category", None) or getattr(sub, "game", None)
+                    cid = getattr(cat, "id", None) if cat else None
+                    if sid is not None and cid is not None:
+                        mapping[int(sid)] = int(cid)
+
+    except Exception as e:
+        log_warn("raise", f"Не смог построить mapping subcat->cat: {short_text(e)}")
+
+    return mapping
+
+def _group_subcats_by_category(subcat_ids: List[int], mapping: Dict[int, int]) -> Dict[int, List[int]]:
+    out: Dict[int, List[int]] = {}
+    for sid in subcat_ids or []:
+        cid = mapping.get(int(sid))
+        if cid is None:
+            continue
+        out.setdefault(int(cid), []).append(int(sid))
+    return out
+
+AUTO_RAISE_LOG_SUBCATS_LIMIT = int(os.getenv("AUTO_RAISE_LOG_SUBCATS_LIMIT", "25"))
+
+def _fmt_ids(ids: List[int], limit: int = AUTO_RAISE_LOG_SUBCATS_LIMIT) -> str:
+    ids = [int(x) for x in (ids or [])]
+    if not ids:
+        return "[]"
+    if len(ids) <= limit:
+        return "[" + ",".join(map(str, ids)) + "]"
+    head = ids[:limit]
+    return "[" + ",".join(map(str, head)) + f",…(+{len(ids)-limit})]"
+
+def _auto_raise_loop(funpay_token: str):
+    if not AUTO_RAISE_LOTS:
+        return
+
+    try:
+        acc = Account(funpay_token)
+        acc.get()
+    except Exception as e:
+        log_error("raise", f"Автоподнятие: не удалось авторизоваться: {short_text(e)}")
+        return
+
+    last_by_cat: Dict[int, float] = {}
+
+    while not _auto_raise_stop.is_set():
+        subcats = [int(x) for x in (AUTO_RAISE_SUBCATS_LIST or [])]
+
+        if not subcats:
+            _auto_raise_stop.wait(30.0)
+            continue
+
+        mapping = _build_subcat_to_cat_map(acc)
+        groups = _group_subcats_by_category(subcats, mapping)
+
+        now = time.time()
+        per_cat_cooldown = max(300.0, float(AUTO_RAISE_INTERVAL_SECONDS))
+
+        if not groups:
+            cat_ids_to_raise = [int(x) for x in subcats]
+        else:
+            cat_ids_to_raise = sorted(set(int(cid) for cid in groups.keys()))
+
+        for cat_id in cat_ids_to_raise:
+            last = last_by_cat.get(cat_id, 0.0)
+            if now - last < per_cat_cooldown:
+                continue
+            try:
+                acc.raise_lots(int(cat_id))
+                last_by_cat[int(cat_id)] = time.time()
+                log_info("raise", f"Подняли категорию {cat_id}")
+            except Exception as e:
+                log_warn("raise", f"Не смог поднять категорию {cat_id}: {short_text(e)}")
+
+        sleep_for = float(AUTO_RAISE_INTERVAL_SECONDS)
+        if AUTO_RAISE_JITTER_SECONDS > 0:
+            sleep_for += random.uniform(0, float(AUTO_RAISE_JITTER_SECONDS))
+
+        log_info("raise", f"Следующее поднятие через {int(sleep_for)}с")
+        _auto_raise_stop.wait(sleep_for)
+
 async def _resolve_user_id_cached(idx: int, username: str) -> int:
     uname = username.lstrip("@")
     key = uname.lower()
@@ -987,6 +1107,38 @@ def expand_assignment(recipients: List[str], qty: int) -> List[str]:
         out.append(recipients[i % len(recipients)])
         i += 1
     return out
+
+def _norm_brand(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = unicodedata.normalize("NFKC", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) not in ("Cf", "Cc"))
+    s = re.sub(r"\s+", "", s).strip().lower()
+    return s
+
+def check_branding_or_warn() -> None:
+    mismatched = []
+    g = globals()
+
+    for k, expected in _EXPECTED_BRANDING.items():
+        current = g.get(k, "")
+        if _norm_brand(current) != _norm_brand(expected):
+            mismatched.append(k)
+
+    if not mismatched:
+        return
+
+    msg = (
+        "❌ Произошла ошибка в проекте "
+        "Напишите пожалуйста создетелю.\n\n"
+        f"Telegram: {_EXPECTED_BRANDING['CREATOR_NAME']}\n"
+    )
+
+    try:
+        logger.critical(msg)
+    except Exception:
+        print(msg)
+
+    raise SystemExit(23)
 
 def _format_plan(assign: List[str]) -> str:
     preview: Dict[str, int] = {}
@@ -1597,6 +1749,7 @@ def _deliver_choice(account: Account, chat_id: int, author_id: int, st: dict, ct
     waiting.pop(author_id, None)
 
 def main():
+    check_branding_or_warn()
     _log_banner_red()
     if not GOLDEN_KEY:
         log_error("", "❌ В .env должен быть FUNPAY_AUTH_TOKEN")
@@ -1640,6 +1793,15 @@ def main():
     global ACCOUNT_GLOBAL
     ACCOUNT_GLOBAL = account
     log_info("", f"Авторизован на FunPay как @{account.username}")
+    if AUTO_RAISE_LOTS:
+        log_info(
+            "raise",
+            f"AUTO_RAISE_LOTS=ON subcats={AUTO_RAISE_SUBCATS_LIST} "
+            f"interval={AUTO_RAISE_INTERVAL_SECONDS}s jitter={AUTO_RAISE_JITTER_SECONDS}s"
+        )
+        threading.Thread(target=_auto_raise_loop, args=(GOLDEN_KEY,), daemon=True).start()
+    else:
+        log_info("raise", "AUTO_RAISE_LOTS=OFF")
     _load_manual_orders()
     log_info("manual", f"Загружено ручных заказов: {len(_MANUAL_ORDERS)}")
 

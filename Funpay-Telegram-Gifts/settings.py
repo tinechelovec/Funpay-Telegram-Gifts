@@ -39,6 +39,10 @@ MAX_SET_SLOTS = 50
 ENV_DEFAULTS: Dict[str, str] = {
     "AUTO_REFUND": "true",
     "AUTO_DEACTIVATE": "true",
+    "AUTO_RAISE_LOTS": "true",
+    "AUTO_RAISE_INTERVAL_SECONDS": "330",
+    "AUTO_RAISE_JITTER_SECONDS": "30",
+    "AUTO_RAISE_CATEGORY_IDS": "",
     "ANONYMOUS_GIFTS": "false",
     "ANONYMOUS_MODE": "seller",
     "CATEGORY_IDS": "3064,2418",
@@ -1121,6 +1125,10 @@ def _print_env_summary() -> None:
         "AUTO_DEACTIVATE",
         "ANONYMOUS_MODE",
         "ANONYMOUS_GIFTS",
+        "AUTO_RAISE_LOTS",
+        "AUTO_RAISE_INTERVAL_SECONDS",
+        "AUTO_RAISE_JITTER_SECONDS",
+        "AUTO_RAISE_CATEGORY_IDS",
         "PRECHECK_BALANCE",
         "REQUIRE_PLUS_CONFIRMATION",
         "REPLY_COOLDOWN_SECONDS",
@@ -1181,6 +1189,23 @@ def _edit_bot_env_flags() -> None:
     _set_env_key("PRECHECK_BALANCE", _prompt_bool_key("PRECHECK_BALANCE", _get_env("PRECHECK_BALANCE"), default=dv_bool("PRECHECK_BALANCE")))
     _set_env_key("REQUIRE_PLUS_CONFIRMATION", _prompt_bool_key("REQUIRE_PLUS_CONFIRMATION", _get_env("REQUIRE_PLUS_CONFIRMATION"), default=dv_bool("REQUIRE_PLUS_CONFIRMATION")))
     _set_env_key("REPLY_COOLDOWN_SECONDS", _prompt_float("REPLY_COOLDOWN_SECONDS", _get_env("REPLY_COOLDOWN_SECONDS"), default=float(ENV_DEFAULTS["REPLY_COOLDOWN_SECONDS"])),)
+    _set_env_key("AUTO_RAISE_LOTS", _prompt_bool_key("AUTO_RAISE_LOTS", _get_env("AUTO_RAISE_LOTS"), default=True))
+    _set_env_key("AUTO_RAISE_INTERVAL_SECONDS", _prompt_float(
+        "AUTO_RAISE_INTERVAL_SECONDS",
+        _get_env("AUTO_RAISE_INTERVAL_SECONDS"),
+        default=float(ENV_DEFAULTS.get("AUTO_RAISE_INTERVAL_SECONDS", "330"))
+    ))
+    _set_env_key("AUTO_RAISE_JITTER_SECONDS", _prompt_float(
+        "AUTO_RAISE_JITTER_SECONDS",
+        _get_env("AUTO_RAISE_JITTER_SECONDS"),
+        default=float(ENV_DEFAULTS.get("AUTO_RAISE_JITTER_SECONDS", "30"))
+    ))
+    print("AUTO_RAISE_CATEGORY_IDS — список subcat ID для автоподнятия.")
+    print("Пусто = использовать CATEGORY_IDS.")
+    cur = _get_env("AUTO_RAISE_CATEGORY_IDS")
+    val = input(f"AUTO_RAISE_CATEGORY_IDS (Enter — оставить '{cur or ''}'): ").strip()
+    if val != "":
+        _set_env_key("AUTO_RAISE_CATEGORY_IDS", val)
     print("✅ Настройки поведения сохранены.")
 
 def _edit_tg_env_settings() -> None:

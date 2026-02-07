@@ -12,7 +12,13 @@ from typing import Optional, Dict
 
 from dotenv import load_dotenv, set_key
 from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded, PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired, PhoneNumberUnoccupied
+from pyrogram.errors import (
+    SessionPasswordNeeded,
+    PhoneNumberInvalid,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    PhoneNumberUnoccupied,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -35,6 +41,18 @@ DEFAULTS: Dict[str, str] = {
     "PRECHECK_BALANCE": "true",
     "REQUIRE_PLUS_CONFIRMATION": "false",
     "GIFT_PARAM_KEY": "gift_tg",
+
+    "AUTO_RAISE_LOTS": "true",
+    "AUTO_RAISE_INTERVAL_SECONDS": "330",
+    "AUTO_RAISE_JITTER_SECONDS": "30",
+    "AUTO_RAISE_CATEGORY_IDS": "",
+
+    "TG_PRIMARY_SESSION": "stars",
+    "TG_SESSIONS": "",
+    "TG_AUTO_SWITCH": "false",
+    "TG_AUTO_SELECT_FOR_PRECHECK": "true",
+    "TG_BALANCE_CACHE_SECONDS": "10",
+    "TG_FAILOVER_NETWORK_PAUSE": "3",
 }
 
 TG_FLOOD_DEFAULTS: Dict[str, str] = {
@@ -239,7 +257,14 @@ def _prompt_float(key: str, current: Optional[str], default: float) -> str:
         except ValueError:
             print("❌ Нужно число, например 1.0")
 
-def _prompt_int_key(key: str, current: Optional[str], default: int, *, min_val: int = 0, max_val: int = 10**12) -> str:
+def _prompt_int_key(
+    key: str,
+    current: Optional[str],
+    default: int,
+    *,
+    min_val: int = 0,
+    max_val: int = 10**12
+) -> str:
     cur_show = current if current else str(default)
     print(f"\n🧮 {key} сейчас: {cur_show}")
     print(f"Введите целое число (Enter оставить/поставить: {cur_show})")
@@ -355,6 +380,12 @@ def env_setup(*, force_all: bool, non_interactive: bool) -> None:
         if missing:
             raise SystemExit(f"❌ Не хватает обязательных ключей в .env: {', '.join(missing)} (режим --non-interactive)")
         _ensure_optional_defaults_written()
+
+        if not get_env("AUTO_RAISE_CATEGORY_IDS"):
+            cat = get_env("CATEGORY_IDS") or DEFAULTS["CATEGORY_IDS"]
+            set_key(ENV_PATH, "AUTO_RAISE_CATEGORY_IDS", cat)
+            load_dotenv(ENV_PATH, override=True)
+
         return
 
     print("🧩 Настройка .env")
@@ -368,7 +399,11 @@ def env_setup(*, force_all: bool, non_interactive: bool) -> None:
     api_hash = _prompt_required_str("API_HASH", get_env("API_HASH") if not force_all else None, secret=False)
     updates["API_HASH"] = api_hash
 
-    funpay_token = _prompt_required_str("FUNPAY_AUTH_TOKEN", get_env("FUNPAY_AUTH_TOKEN") if not force_all else None, secret=True)
+    funpay_token = _prompt_required_str(
+        "FUNPAY_AUTH_TOKEN",
+        get_env("FUNPAY_AUTH_TOKEN") if not force_all else None,
+        secret=True,
+    )
     updates["FUNPAY_AUTH_TOKEN"] = funpay_token
 
     if force_all or get_env("AUTO_REFUND") is None:
@@ -382,6 +417,35 @@ def env_setup(*, force_all: bool, non_interactive: bool) -> None:
 
     if force_all or get_env("CATEGORY_IDS") is None:
         updates["CATEGORY_IDS"] = _prompt_category_ids("CATEGORY_IDS", get_env("CATEGORY_IDS"), default=DEFAULTS["CATEGORY_IDS"])
+
+    if force_all or get_env("AUTO_RAISE_LOTS") is None:
+        updates["AUTO_RAISE_LOTS"] = _prompt_bool_key(
+            "AUTO_RAISE_LOTS",
+            get_env("AUTO_RAISE_LOTS"),
+            default=(DEFAULTS["AUTO_RAISE_LOTS"] == "true"),
+        )
+
+    if force_all or get_env("AUTO_RAISE_INTERVAL_SECONDS") is None:
+        updates["AUTO_RAISE_INTERVAL_SECONDS"] = _prompt_float(
+            "AUTO_RAISE_INTERVAL_SECONDS",
+            get_env("AUTO_RAISE_INTERVAL_SECONDS"),
+            default=float(DEFAULTS["AUTO_RAISE_INTERVAL_SECONDS"]),
+        )
+
+    if force_all or get_env("AUTO_RAISE_JITTER_SECONDS") is None:
+        updates["AUTO_RAISE_JITTER_SECONDS"] = _prompt_float(
+            "AUTO_RAISE_JITTER_SECONDS",
+            get_env("AUTO_RAISE_JITTER_SECONDS"),
+            default=float(DEFAULTS["AUTO_RAISE_JITTER_SECONDS"]),
+        )
+
+    if force_all or get_env("AUTO_RAISE_CATEGORY_IDS") is None:
+        base_default = updates.get("CATEGORY_IDS") or get_env("CATEGORY_IDS") or DEFAULTS["CATEGORY_IDS"]
+        updates["AUTO_RAISE_CATEGORY_IDS"] = _prompt_category_ids(
+            "AUTO_RAISE_CATEGORY_IDS",
+            get_env("AUTO_RAISE_CATEGORY_IDS"),
+            default=base_default,
+        )
 
     if force_all or get_env("REPLY_COOLDOWN_SECONDS") is None:
         updates["REPLY_COOLDOWN_SECONDS"] = _prompt_float(
@@ -411,6 +475,12 @@ def env_setup(*, force_all: bool, non_interactive: bool) -> None:
 
     load_dotenv(ENV_PATH, override=True)
     _ensure_optional_defaults_written()
+
+    if not get_env("AUTO_RAISE_CATEGORY_IDS"):
+        cat = get_env("CATEGORY_IDS") or DEFAULTS["CATEGORY_IDS"]
+        set_key(ENV_PATH, "AUTO_RAISE_CATEGORY_IDS", cat)
+        load_dotenv(ENV_PATH, override=True)
+
     print("\n✅ .env обновлён.\n")
 
 def ask_phone() -> str:
@@ -574,6 +644,8 @@ async def main(args) -> int:
         print("❌ API_ID должен быть числом.")
         return 1
 
+    created_sessions: list[str] = []
+
     idx = 1
     while True:
         session_name = _next_session_name(idx)
@@ -583,11 +655,27 @@ async def main(args) -> int:
         rc = await _ensure_one_session(api_id_int, API_HASH, session_name)
         if rc != 0:
             return rc
+
+        created_sessions.append(session_name)
+
         if not _ask_yes_no("\n➕ Добавить ещё один аккаунт?", default=False):
             break
         idx += 1
 
+    if created_sessions:
+        set_key(ENV_PATH, "TG_SESSIONS", ",".join(created_sessions))
+
+        if get_env("TG_PRIMARY_SESSION") is None or args.force_env:
+            set_key(ENV_PATH, "TG_PRIMARY_SESSION", created_sessions[0])
+
+        if get_env("TG_AUTO_SWITCH") is None:
+            set_key(ENV_PATH, "TG_AUTO_SWITCH", "true" if len(created_sessions) > 1 else "false")
+
+        load_dotenv(ENV_PATH, override=True)
+
     print("\n✅ Готово. Сессии лежат в папке sessions.")
+    print(f"🧾 TG_SESSIONS = {','.join(created_sessions) if created_sessions else '(не создано)'}")
+    print(f"⭐ TG_PRIMARY_SESSION = {get_env('TG_PRIMARY_SESSION') or 'stars'}")
     return 0
 
 if __name__ == "__main__":
